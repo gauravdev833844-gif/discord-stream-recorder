@@ -13,6 +13,7 @@ if not TOKEN:
     print("❌ ERROR: DISCORD_TOKEN environment variable is missing!")
     sys.exit(1)
 
+clean_token = TOKEN.strip().strip('"').strip("'")
 GUILD_ID = "1429959255309684798"
 TARGET_CHANNELS = [
     ("1429959256651595930", "FLOXI ARMY"),
@@ -36,7 +37,7 @@ async def main():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False, # Displayed inside Xvfb (:99)
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -52,44 +53,51 @@ async def main():
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
         )
+
+        # Injects token into localStorage on every page navigation
+        init_script = f"""
+            try {{
+                window.localStorage.setItem('token', JSON.stringify("{clean_token}"));
+            }} catch(e) {{}}
+        """
+        await context.add_init_script(init_script)
+
         page = await context.new_page()
 
-        print("\n[1/4] Navigating to Discord login page...")
-        await page.goto("https://discord.com/login", wait_until="domcontentloaded")
-        await asyncio.sleep(2)
-
-        print("[2/4] Injecting Discord authentication token...")
-        clean_token = TOKEN.strip().strip('"').strip("'")
-        await page.evaluate(f"""
-            window.localStorage.setItem('token', JSON.stringify("{clean_token}"));
-        """)
-
         target_url = f"https://discord.com/channels/{GUILD_ID}/1429959256651595930"
-        print(f"[3/4] Redirecting to target server ({target_url})...")
-        await page.goto(target_url, wait_until="networkidle")
-        await asyncio.sleep(5)
+        print(f"[1/3] Navigating to Discord target channel: {target_url}")
+        try:
+            await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"Navigation warning: {e}")
 
-        # Verification screenshot
+        # Wait 10 seconds for Discord React app to initialize
+        print("[2/3] Waiting for Discord React application to load...")
+        await asyncio.sleep(10)
+
+        # Save verification screenshot
         screenshot_path = os.path.join(SCREENSHOT_DIR, "login_verification.png")
         await page.screenshot(path=screenshot_path)
         print(f"📸 Verification screenshot saved: {screenshot_path}")
 
-        print("\n[4/4] Actively monitoring for Floxi Indori live streams...")
+        print("\n[3/3] Actively monitoring for Floxi Indori live streams...")
         ffmpeg_proc = None
         is_recording = False
         start_time = time.time()
-        max_duration = 3.5 * 3600  # 3.5 hours max per shift
+        max_duration = 3.5 * 3600  # 3.5 hours per shift
 
+        loop_count = 0
         while (time.time() - start_time) < max_duration:
+            loop_count += 1
             try:
-                # Check each channel for LIVE badge
+                # Check target channels
                 for channel_id, channel_name in TARGET_CHANNELS:
                     selector = f'a[href*="/channels/{GUILD_ID}/{channel_id}"]'
                     channel_elem = await page.query_selector(selector)
                     if not channel_elem:
                         continue
 
-                    # Check parent container for "LIVE" text or badge
+                    # Check for LIVE badge
                     has_live = await page.evaluate("""(chId) => {
                         const link = document.querySelector(`a[href*="${chId}"]`);
                         if (!link) return false;
@@ -127,7 +135,7 @@ async def main():
                             print("✅ Clicked 'Watch Stream'!")
                         await asyncio.sleep(2)
 
-                        # Take stream started screenshot
+                        # Stream started screenshot
                         await page.screenshot(path=os.path.join(SCREENSHOT_DIR, "stream_started.png"))
 
                         # Start FFmpeg recording
@@ -161,7 +169,7 @@ async def main():
                     }""")
 
                     if stream_ended:
-                        print("\n⏹️ Stream ended detected. Stopping FFmpeg cleanly...")
+                        print("\n⏹️ Stream ended. Stopping FFmpeg cleanly...")
                         try:
                             ffmpeg_proc.stdin.write(b'q')
                             ffmpeg_proc.stdin.flush()
@@ -175,12 +183,15 @@ async def main():
                         print("🎉 Recording saved successfully!")
                         break
 
+                if loop_count % 60 == 0:
+                    print(f"⏱️ Monitoring active... (Elapsed: {int((time.time() - start_time) / 60)} mins)")
+
             except Exception as e:
                 print(f"Monitoring loop warning: {e}")
 
             await asyncio.sleep(5)
 
-        # Cleanup if still recording at shift end
+        # Cleanup at shift end
         if is_recording and ffmpeg_proc:
             print("Shift ended. Finalizing recording...")
             try:
