@@ -8,3 +8,4 @@ Automated 24/7 cloud recorder running on GitHub Actions to capture Floxi Indori'
 - PulseAudio virtual sound sink capturing all voice channel participants
 - Automatic stream detection and "Watch Stream" trigger
 - Saves video to GitHub Actions Artifacts and Gofile
+
