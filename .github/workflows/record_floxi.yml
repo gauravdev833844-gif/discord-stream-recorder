@@ -30,8 +30,9 @@ jobs:
         run: |
           pulseaudio -D --exit-idle-time=-1 || true
           pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description="DiscordSink" || true
+          pactl load-module module-null-sink sink_name=SilentMic sink_properties=device.description="SilentMic" || true
           pactl set-default-sink DiscordSink || true
-          pactl set-default-source DiscordSink.monitor || true
+          pactl set-default-source SilentMic.monitor || true
           Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
           sleep 2
 
@@ -39,6 +40,7 @@ jobs:
         env:
           DISPLAY: :99
           PULSE_SINK: DiscordSink
+          PULSE_SOURCE: SilentMic.monitor
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           MAX_RUNTIME_SECONDS: "13500"
         run: |

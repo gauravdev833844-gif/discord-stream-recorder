@@ -27,16 +27,18 @@ SCREENSHOT_DIR = "screenshots"
 
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
 stop_requested = False
+
 
 def handle_sigterm(signum, frame):
     global stop_requested
     print(f"[SIGNAL] Received signal {signum}, initiating graceful shutdown...")
     stop_requested = True
 
+
 signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
+
 
 def start_ffmpeg(output_path: str) -> subprocess.Popen:
     cmd = [
@@ -67,6 +69,7 @@ def start_ffmpeg(output_path: str) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
     )
 
+
 def stop_ffmpeg(proc: subprocess.Popen):
     if proc and proc.poll() is None:
         print("[FFMPEG] Sending 'q' to finalize container safely...")
@@ -81,6 +84,7 @@ def stop_ffmpeg(proc: subprocess.Popen):
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+
 
 async def expand_all_categories(page):
     """Expands any collapsed voice/text categories so sidebar virtualization doesn't hide channels."""
@@ -98,6 +102,24 @@ async def expand_all_categories(page):
     except Exception as e:
         print(f"[WARN] Category expand warning: {e}")
 
+
+async def ensure_self_muted(page):
+    """Safely mutes ONLY the user's microphone in the bottom-left user panel (never the stream speaker)."""
+    try:
+        await page.evaluate("""
+            () => {
+                const panels = document.querySelector('[class*="panels" i], section[aria-label*="User" i]');
+                if (!panels) return;
+                const muteBtn = panels.querySelector('button[aria-label="Mute"][role="switch"]');
+                if (muteBtn && muteBtn.getAttribute('aria-checked') === 'false') {
+                    muteBtn.click();
+                }
+            }
+        """)
+    except Exception:
+        pass
+
+
 async def check_channel_live(page, channel_id: str) -> bool:
     """Checks if a target voice channel has a LIVE indicator in the sidebar."""
     try:
@@ -110,7 +132,7 @@ async def check_channel_live(page, channel_id: str) -> bool:
                 const container = link.closest('li') || link.parentElement;
                 if (!container) return false;
                 const textHasLive = /\\bLIVE\\b/i.test(container.textContent || "");
-                const badgeHasLive = container.querySelector('[class*="liveBadge"], [class*="live_"], [class*="live-"]') !== null;
+                const badgeHasLive = container.querySelector('[class*="liveBadge" i], [class*="live_" i], [class*="live-" i]') !== null;
                 return textHasLive || badgeHasLive;
             }
             """,
@@ -119,6 +141,7 @@ async def check_channel_live(page, channel_id: str) -> bool:
     except Exception as e:
         print(f"[WARN] Error checking channel {channel_id}: {e}")
         return False
+
 
 async def wait_for_stream_video(page, timeout_sec: int = 25) -> bool:
     """Waits up to timeout_sec for the WebRTC/DAVE video stream to decode frames."""
@@ -138,6 +161,7 @@ async def wait_for_stream_video(page, timeout_sec: int = 25) -> bool:
         await asyncio.sleep(1)
     return False
 
+
 async def leave_stream_and_voice(page):
     """Exits Fullscreen and disconnects from the voice channel cleanly."""
     try:
@@ -151,6 +175,7 @@ async def leave_stream_and_voice(page):
     except Exception as e:
         print(f"[WARN] Error during voice disconnect: {e}")
 
+
 async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) -> bool:
     print(f"[STREAM] Connecting to '{channel_name}' ({channel_id})...")
     link = page.locator(f'a[href*="/{channel_id}"]').first
@@ -158,7 +183,24 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) 
         return False
 
     await link.click()
-    await asyncio.sleep(4)
+    await asyncio.sleep(3)
+
+    # If Discord opens a voice lobby preview, click 'Join Voice' first and let it connect
+    joined_lobby = await page.evaluate("""
+        () => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const joinBtn = buttons.find(b => b.textContent && b.textContent.toLowerCase().includes('join voice'));
+            if (joinBtn) {
+                joinBtn.click();
+                return true;
+            }
+            return false;
+        }
+    """)
+    if joined_lobby:
+        await asyncio.sleep(3)
+
+    await ensure_self_muted(page)
 
     # Attempt up to 4 times to click 'Watch Stream' or a true stream tile (never normal voice avatar tiles)
     watch_clicked = False
@@ -171,9 +213,8 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) 
                     watchBtn.click();
                     return true;
                 }
-                // Only click tiles that explicitly contain a LIVE indicator or stream preview
                 const streamTile = document.querySelector(
-                    '[class*="streamPreview"], [class*="tile"]:has([class*="live"])'
+                    '[class*="streamPreview" i], [class*="tile" i]:has([class*="live" i])'
                 );
                 if (streamTile) {
                     streamTile.click();
@@ -223,6 +264,7 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) 
     await page.screenshot(path=f"{SCREENSHOT_DIR}/stream_started_{int(time.time())}.png")
     return True
 
+
 async def is_stream_still_active(page) -> bool:
     """Verifies that an active stream video element (>=320px width) is still playing."""
     try:
@@ -238,6 +280,7 @@ async def is_stream_still_active(page) -> bool:
         """)
     except Exception:
         return False
+
 
 async def main():
     if not DISCORD_TOKEN:
@@ -302,6 +345,7 @@ async def main():
         await asyncio.sleep(10)
 
         await expand_all_categories(page)
+        await ensure_self_muted(page)
         await page.mouse.move(0, 0)
         await page.screenshot(path=f"{SCREENSHOT_DIR}/01_guild_loaded.png")
         print("[MONITOR] Polling 6 voice channels every 5 seconds...")
@@ -353,6 +397,7 @@ async def main():
                 stop_ffmpeg(ffmpeg_proc)
             await browser.close()
             print("[SHUTDOWN] Browser closed cleanly.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
