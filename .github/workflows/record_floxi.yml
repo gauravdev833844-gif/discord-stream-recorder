@@ -1,0 +1,72 @@
+name: Discord Floxi Indori Cloud Recorder
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs at 17:15 UTC (10:45 PM IST) and 21:15 UTC (2:45 AM IST)
+    - cron: '15 17 * * *'
+    - cron: '15 21 * * *'
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb pulseaudio pulseaudio-utils ffmpeg libasound2
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Start Virtual Display & Virtual Soundcard
+        run: |
+          # Start Xvfb on display :99
+          Xvfb :99 -screen 0 1920x1080x24 -ac &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+
+          # Start PulseAudio daemon and setup virtual sink
+          pulseaudio -D --exit-idle-time=-1 || true
+          sleep 2
+          pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description=DiscordVirtualSink || true
+          pactl set-default-sink DiscordSink || true
+          pactl list sinks short
+
+      - name: Run Discord Stream Recorder
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISPLAY: :99
+        run: |
+          python -u recorder.py
+
+      - name: Upload Verification Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: discord-screenshots
+          path: screenshots/
+          retention-days: 7
+
+      - name: Upload Recorded Stream Video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: floxi-live-video
+          path: Floxi_Indori_Live.mp4
+          retention-days: 7
+          if-no-files-found: ignore
