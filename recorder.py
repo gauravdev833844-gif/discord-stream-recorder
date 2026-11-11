@@ -559,24 +559,26 @@ async def main():
     safe_token_json = json.dumps(DISCORD_TOKEN)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[
-                "--autoplay-policy=no-user-gesture-required",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--enable-unsafe-swiftshader",
-                "--disable-gpu-sandbox",
-                "--use-fake-ui-for-media-stream",
-                "--no-sandbox",
-                "--window-position=0,0",
-                "--window-size=1920,1080",
-                "--start-fullscreen",
-            ],
-        )
+        launch_args = [
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--enable-unsafe-swiftshader",
+            "--disable-gpu-sandbox",
+            "--use-fake-ui-for-media-stream",
+            "--no-sandbox",
+            "--window-position=0,0",
+            "--window-size=1920,1080",
+            "--start-fullscreen",
+        ]
+        try:
+            browser = await p.chromium.launch(headless=False, args=launch_args)
+        except Exception as launch_err:
+            print(f"[WARN] Bundled Chromium launch failed ({launch_err}), falling back to system Chrome...")
+            browser = await p.chromium.launch(channel="chrome", headless=False, args=launch_args)
 
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},

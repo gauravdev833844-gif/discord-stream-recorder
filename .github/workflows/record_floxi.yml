@@ -51,11 +51,50 @@ jobs:
 
       - name: Install System Dependencies (Xvfb, PulseAudio, FFmpeg)
         run: |
-          printf 'Acquire::ForceIPv4 "true";\nAcquire::http::Timeout "15";\nAcquire::Retries "3";\n' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb pulseaudio ffmpeg jq curl
+          echo "=== Checking Preinstalled Binaries ==="
+          which ffmpeg jq curl Xvfb pulseaudio google-chrome || true
+          MISSING_PKGS=""
+          command -v Xvfb >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS xvfb"
+          command -v pulseaudio >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS pulseaudio"
+          command -v ffmpeg >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS ffmpeg"
+          command -v jq >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS jq"
+          command -v curl >/dev/null 2>&1 || MISSING_PKGS="$MISSING_PKGS curl"
+          echo "Missing system packages: ${MISSING_PKGS:-none}"
+
+          if [ -n "$MISSING_PKGS" ]; then
+            printf 'Acquire::ForceIPv4 "true";\nAcquire::http::Timeout "10";\nAcquire::Retries "2";\n' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
+            MIRRORS=(
+              "https://mirrors.edge.kernel.org/ubuntu/"
+              "http://us.archive.ubuntu.com/ubuntu/"
+              "http://archive.ubuntu.com/ubuntu/"
+            )
+            WORKING_MIRROR=""
+            for m in "${MIRRORS[@]}"; do
+              if curl -sfI --max-time 4 "${m}dists/noble/Release" >/dev/null 2>&1; then
+                WORKING_MIRROR="$m"
+                break
+              fi
+            done
+            if [ -n "$WORKING_MIRROR" ]; then
+              echo "Switching Ubuntu mirror to verified host: $WORKING_MIRROR"
+              sudo sed -i "s|http://azure.archive.ubuntu.com/ubuntu/|$WORKING_MIRROR|g; s|http://azure.archive.ubuntu.com/ubuntu|$WORKING_MIRROR|g" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt 2>/dev/null || true
+            else
+              echo "Fallback mirror probe failed; checking DNS resolver..."
+              printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null || true
+            fi
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $MISSING_PKGS
+          fi
+
           pip install playwright
-          playwright install --with-deps chromium
+          playwright install chromium
+          CHROMIUM_BIN=$(python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()" 2>/dev/null || true)
+          if [ -n "$CHROMIUM_BIN" ] && ldd "$CHROMIUM_BIN" 2>/dev/null | grep -q "not found"; then
+            echo "Installing missing Chromium shared libraries..."
+            sudo playwright install-deps chromium
+          else
+            echo "All Chromium shared libraries are already satisfied!"
+          fi
 
       - name: Start & Verify Virtual Display and PulseAudio Sinks (Fail-Fast)
         run: |
