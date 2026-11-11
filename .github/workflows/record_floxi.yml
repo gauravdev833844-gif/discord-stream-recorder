@@ -25,22 +25,24 @@ concurrency:
 
 jobs:
   record:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Free Runner Disk Space & Verify Available Storage
+      - name: Check & Free Runner Disk Space (Only If Below 40 GB)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/dotnet || true
-          df -h /
           FREE_MB=$(df -BM / | awk 'NR==2 {gsub("M","",$4); print $4}')
-          echo "Available disk space: ${FREE_MB} MB"
-          if [ "$FREE_MB" -lt 15000 ]; then
-            echo "WARNING: Less than 15 GB free on runner!"
+          echo "Initial available disk space: ${FREE_MB} MB"
+          if [ "$FREE_MB" -lt 40000 ]; then
+            echo "Freeing unused SDKs to ensure 40+ GB buffer..."
+            sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/dotnet || true
+            FREE_MB=$(df -BM / | awk 'NR==2 {gsub("M","",$4); print $4}')
+            echo "Updated available disk space: ${FREE_MB} MB"
           fi
+          df -h /
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,8 +51,9 @@ jobs:
 
       - name: Install System Dependencies (Xvfb, PulseAudio, FFmpeg)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb pulseaudio ffmpeg jq curl
+          printf 'Acquire::ForceIPv4 "true";\nAcquire::http::Timeout "15";\nAcquire::Retries "3";\n' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb pulseaudio ffmpeg jq curl
           pip install playwright
           playwright install --with-deps chromium
 
