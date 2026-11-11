@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -7,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from playwright.async_api import async_playwright
 
-sys.stdout.reconfigure(encoding='utf-8')
+sys.stdout.reconfigure(encoding="utf-8")
 
 # Target Server & Channels (FLOXI INDORI ARMY)
 GUILD_ID = "1429959255309684798"
@@ -21,13 +22,22 @@ TARGET_CHANNELS = [
 ]
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip().strip('"').strip("'")
-MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "13500"))  # 3h 45m shift
+MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "13200"))  # 3h 40m per shift
+FAILED_JOIN_COOLDOWN_SEC = 90
+INACTIVE_GRACE_CHECKS = 15  # 15 checks at 5s interval = 75s grace for static screen-shares
+MAX_FFMPEG_FAST_CRASHES = 3
+MAX_FFMPEG_TOTAL_RESTARTS = 6
+MAX_STALLED_FILE_CHECKS = 6  # 6 checks at 5s interval = 30s max with zero bytes written
+
 RECORDINGS_DIR = "recordings"
 SCREENSHOT_DIR = "screenshots"
+LOGS_DIR = "logs"
 
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+for d in (RECORDINGS_DIR, SCREENSHOT_DIR, LOGS_DIR):
+    os.makedirs(d, exist_ok=True)
+
 stop_requested = False
+last_video_state = {"time": -1.0, "frames": -1}
 
 
 def handle_sigterm(signum, frame):
@@ -40,7 +50,38 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 signal.signal(signal.SIGINT, handle_sigterm)
 
 
-def start_ffmpeg(output_path: str) -> subprocess.Popen:
+async def safe_screenshot(page, path: str):
+    """Takes a diagnostic screenshot without raising unhandled exceptions."""
+    try:
+        await page.screenshot(path=path, timeout=5000)
+    except Exception as e:
+        print(f"[WARN] Screenshot failed ({path}): {e}")
+
+
+def verify_pulseaudio_routing():
+    """Ensures all active Chromium PulseAudio sink-inputs are unmuted and routed to DiscordSink."""
+    try:
+        res = subprocess.run(
+            ["pactl", "list", "short", "sink-inputs"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if lines:
+            print(f"[AUDIO] Active PulseAudio sink-inputs ({len(lines)}): {lines[0]}")
+            for line in lines:
+                input_id = line.split()[0]
+                subprocess.run(["pactl", "set-sink-input-mute", input_id, "0"], timeout=3)
+                subprocess.run(["pactl", "move-sink-input", input_id, "DiscordSink"], timeout=3)
+        else:
+            print("[AUDIO] No active PulseAudio sink-input yet (stream may be silent or initializing).")
+    except Exception as e:
+        print(f"[WARN] PulseAudio routing check warning: {e}")
+
+
+def start_ffmpeg(output_path: str, log_path: str) -> subprocess.Popen:
+    log_file = open(log_path, "ab")
     cmd = [
         "ffmpeg", "-y",
         "-thread_queue_size", "4096",
@@ -52,63 +93,127 @@ def start_ffmpeg(output_path: str) -> subprocess.Popen:
         "-f", "pulse", "-i", "DiscordSink.monitor",
         "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-threads", "2",
         "-crf", "23",
-        "-maxrate", "4000k",
-        "-bufsize", "8000k",
+        "-maxrate", "3500k",
+        "-bufsize", "7000k",
+        "-g", "60",
+        "-fps_mode", "cfr",
         "-pix_fmt", "yuv420p",
         "-af", "aresample=async=1:first_pts=0",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
         output_path,
     ]
-    print(f"[FFMPEG] Starting capture -> {output_path}")
-    return subprocess.Popen(
+    print(f"[FFMPEG] Starting capture -> {output_path} (Log: {log_path})")
+    proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
+    proc._log_file = log_file
+    proc._output_path = output_path
+    proc._start_ts = time.time()
+    return proc
 
 
 def stop_ffmpeg(proc: subprocess.Popen):
-    if proc and proc.poll() is None:
+    if not proc:
+        return
+    if proc.poll() is None:
         print("[FFMPEG] Sending 'q' to finalize container safely...")
         try:
             proc.stdin.write(b"q\n")
             proc.stdin.flush()
-            proc.wait(timeout=15)
+            proc.wait(timeout=12)
         except Exception as e:
             print(f"[FFMPEG] Graceful stop timed out ({e}), terminating...")
             proc.terminate()
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=4)
             except Exception:
                 proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+    else:
+        print(f"[FFMPEG] Process already exited with code {proc.returncode}")
+
+    if hasattr(proc, "_log_file") and proc._log_file:
+        try:
+            proc._log_file.close()
+        except Exception:
+            pass
+
+    out_file = getattr(proc, "_output_path", None)
+    if out_file and os.path.exists(out_file):
+        try:
+            size_bytes = os.path.getsize(out_file)
+            if size_bytes < 65536:
+                print(f"[CLEANUP] Removing tiny/corrupt segment {out_file} ({size_bytes} bytes)")
+                os.remove(out_file)
+            else:
+                print(f"[FFMPEG] Finalized segment {out_file} ({size_bytes // 1024} KB)")
+        except Exception:
+            pass
 
 
-async def expand_all_categories(page):
-    """Expands any collapsed voice/text categories so sidebar virtualization doesn't hide channels."""
+async def verify_discord_login(page, timeout_sec: int = 35) -> bool:
+    """Verifies that authentication succeeded AND the target guild's channel list loaded."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        url = page.url
+        if "/login" not in url:
+            guild_loaded = await page.evaluate(
+                """
+                (guildId) => {
+                    const hasGuildLink = document.querySelector(`a[href*="/channels/${guildId}/"]`) !== null;
+                    const hasChannelsNav = document.querySelector('#channels, nav[aria-label*="channel" i]') !== null;
+                    return hasGuildLink && hasChannelsNav;
+                }
+                """,
+                GUILD_ID,
+            )
+            if guild_loaded:
+                return True
+        await asyncio.sleep(1)
+    return False
+
+
+async def dismiss_modals_and_expand_categories(page):
+    """Dismisses Discord promo/quest modals and expands ONLY collapsed channel categories (never server header)."""
     try:
+        if await page.locator('[role="dialog"]').count() > 0:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+
         await page.evaluate("""
             () => {
-                const collapsed = document.querySelectorAll('[aria-expanded="false"]');
-                collapsed.forEach(el => {
-                    if (el.getAttribute('role') === 'button' || el.tagName === 'H3') {
+                const scroller = document.querySelector('#channels [class*="scroller" i], nav [class*="scroller" i]');
+                if (!scroller) return;
+                scroller.querySelectorAll('[aria-expanded="false"]').forEach(el => {
+                    const isCategory = el.tagName === 'H3' ||
+                        el.closest('[class*="containerDefault" i], [class*="category" i], [class*="section" i]') !== null;
+                    const isHeader = el.closest('header') !== null;
+                    if (isCategory && !isHeader) {
                         el.click();
                     }
                 });
             }
         """)
     except Exception as e:
-        print(f"[WARN] Category expand warning: {e}")
+        print(f"[WARN] Modal/Category cleanup warning: {e}")
 
 
 async def ensure_self_muted(page):
-    """Safely mutes ONLY the user's microphone in the bottom-left user panel (never the stream speaker)."""
+    """Safely mutes ONLY the user's microphone in the bottom-left user panel."""
     try:
         await page.evaluate("""
             () => {
-                const panels = document.querySelector('[class*="panels" i], section[aria-label*="User" i]');
+                const panels = document.querySelector('section[aria-label*="User" i], [class*="panels" i]');
                 if (!panels) return;
                 const muteBtn = panels.querySelector('button[aria-label="Mute"][role="switch"]');
                 if (muteBtn && muteBtn.getAttribute('aria-checked') === 'false') {
@@ -120,72 +225,215 @@ async def ensure_self_muted(page):
         pass
 
 
-async def check_channel_live(page, channel_id: str) -> bool:
-    """Checks if a target voice channel has a LIVE indicator in the sidebar."""
+async def scan_all_channels_in_sidebar(page, channel_ids: list[str]) -> dict[str, bool]:
+    """Sweeps the virtualized sidebar once and checks LIVE status for all target channels."""
     try:
         return await page.evaluate(
             """
-            (chId) => {
-                const link = document.querySelector(`a[href*="/${chId}"]`);
-                if (!link) return false;
-                link.scrollIntoView({ block: 'center', behavior: 'instant' });
-                const container = link.closest('li') || link.parentElement;
-                if (!container) return false;
-                const textHasLive = /\\bLIVE\\b/i.test(container.textContent || "");
-                const badgeHasLive = container.querySelector('[class*="liveBadge" i], [class*="live_" i], [class*="live-" i]') !== null;
-                return textHasLive || badgeHasLive;
+            async (chIds) => {
+                const results = {};
+                chIds.forEach(id => { results[id] = false; });
+
+                const checkVisible = () => {
+                    for (const chId of chIds) {
+                        if (results[chId]) continue;
+                        const link = document.querySelector(`a[href*="/${chId}"]`);
+                        if (!link) continue;
+                        const container = link.closest('li, [data-dnd-name], [class*="containerDefault" i]') || link.parentElement;
+                        if (!container) continue;
+                        const badgeHasLive = container.querySelector(
+                            '[class*="liveBadge" i], [class*="liveIndicator" i], [class*="live_" i], [class*="liveSmall" i]'
+                        ) !== null;
+                        // Use innerText instead of textContent so adjacent React spans/divs keep word boundaries
+                        const textHasLive = /\\bLIVE\\b/.test(container.innerText || "");
+                        if (badgeHasLive || textHasLive) {
+                            results[chId] = true;
+                        }
+                    }
+                };
+
+                checkVisible();
+                const scroller = document.querySelector('#channels [class*="scroller" i], nav [class*="scroller" i]');
+                if (!scroller) return results;
+
+                scroller.scrollTop = 0;
+                await new Promise(r => setTimeout(r, 80));
+                const maxScroll = scroller.scrollHeight;
+                for (let pos = 0; pos <= maxScroll; pos += 350) {
+                    scroller.scrollTop = pos;
+                    await new Promise(r => setTimeout(r, 60));
+                    checkVisible();
+                }
+                scroller.scrollTop = 0;
+                return results;
+            }
+            """,
+            channel_ids,
+        )
+    except Exception as e:
+        print(f"[WARN] Error during batch sidebar scan: {e}")
+        return {cid: False for cid in channel_ids}
+
+
+async def scroll_channel_into_view(page, channel_id: str) -> bool:
+    """Scrolls a specific channel link into the viewport before clicking."""
+    try:
+        return await page.evaluate(
+            """
+            async (chId) => {
+                const scroller = document.querySelector('#channels [class*="scroller" i], nav [class*="scroller" i]');
+                const tryFocus = () => {
+                    const link = document.querySelector(`a[href*="/${chId}"]`);
+                    if (!link) return false;
+                    link.scrollIntoView({ block: 'center', behavior: 'instant' });
+                    return true;
+                };
+                if (tryFocus() || !scroller) return tryFocus();
+                scroller.scrollTop = 0;
+                for (let pos = 0; pos <= scroller.scrollHeight; pos += 350) {
+                    scroller.scrollTop = pos;
+                    await new Promise(r => setTimeout(r, 60));
+                    if (tryFocus()) return true;
+                }
+                return false;
             }
             """,
             channel_id,
         )
-    except Exception as e:
-        print(f"[WARN] Error checking channel {channel_id}: {e}")
+    except Exception:
         return False
 
 
-async def wait_for_stream_video(page, timeout_sec: int = 25) -> bool:
-    """Waits up to timeout_sec for the WebRTC/DAVE video stream to decode frames."""
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        try:
-            ready = await page.evaluate("""
-                () => {
-                    const videos = Array.from(document.querySelectorAll('video'));
-                    return videos.some(v => v.readyState >= 2 && !v.paused && v.videoWidth >= 320);
+async def get_active_stream_video_state(page) -> dict:
+    """Finds the active stream video (verifying WebRTC MediaStreamTrack + prioritizing stream tiles over webcams)."""
+    try:
+        return await page.evaluate("""
+            () => {
+                const allVideos = Array.from(document.querySelectorAll('video'))
+                    .filter(v => {
+                        if (v.readyState < 2 || v.paused || v.videoWidth < 320) return false;
+                        if (v.srcObject && typeof v.srcObject.getVideoTracks === 'function') {
+                            const tracks = v.srcObject.getVideoTracks();
+                            if (tracks.length > 0 && !tracks.some(t => t.readyState === 'live')) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    });
+
+                if (!allVideos.length) {
+                    return { active: false, currentTime: -1, frames: -1, box: null };
                 }
-            """)
-            if ready:
-                return True
-        except Exception:
-            pass
+
+                const scored = allVideos.map(v => {
+                    const tile = v.closest('[class*="tile" i], [class*="videoWrapper" i], [class*="stream" i]');
+                    const isStreamTile = tile ? (
+                        tile.querySelector('[class*="liveBadge" i], [class*="liveIndicator" i], [class*="live_" i]') !== null ||
+                        /\\bLIVE\\b/.test(tile.innerText || "")
+                    ) : false;
+                    const area = Math.imul(v.videoWidth, v.videoHeight);
+                    const score = (isStreamTile ? 100000000 : 0) + area;
+                    return { v, score };
+                });
+
+                scored.sort((a, b) => b.score - a.score);
+                const mainVid = scored[0].v;
+
+                const wrapper = mainVid.parentElement ? mainVid.parentElement.parentElement : null;
+                const stageText = wrapper ? (wrapper.innerText || "") : "";
+                if (stageText.includes("Stream has ended") || stageText.includes("stream is currently paused")) {
+                    return { active: false, currentTime: -1, frames: -1, box: null };
+                }
+
+                const q = mainVid.getVideoPlaybackQuality ? mainVid.getVideoPlaybackQuality() : null;
+                const frames = q ? q.totalVideoFrames : 1;
+                const r = mainVid.getBoundingClientRect();
+                const box = (r.width >= 100 && r.height >= 100)
+                    ? { x: r.left + Math.min(200, r.width / 4), y: r.top + Math.min(200, r.height / 4) }
+                    : null;
+
+                return {
+                    active: mainVid.currentTime > 0 && frames > 0,
+                    currentTime: mainVid.currentTime,
+                    frames: frames,
+                    box: box
+                };
+            }
+        """)
+    except Exception:
+        return {"active": False, "currentTime": -1, "frames": -1, "box": None}
+
+
+async def wait_for_stream_video(page, timeout_sec: int = 25) -> dict:
+    """Waits up to timeout_sec for the primary stream video to decode frames."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline and not stop_requested:
+        state = await get_active_stream_video_state(page)
+        if state.get("active"):
+            return state
         await asyncio.sleep(1)
-    return False
+    return {"active": False, "currentTime": -1, "frames": -1, "box": None}
 
 
-async def leave_stream_and_voice(page):
-    """Exits Fullscreen and disconnects from the voice channel cleanly."""
+async def leave_stream_and_voice(page, guild_url: str = ""):
+    """Exits Fullscreen, clicks Disconnect, and verifies voice disconnection (with hard WebRTC reset fallback)."""
     try:
         await page.keyboard.press("Escape")
         await asyncio.sleep(1)
-        disconnect_btn = page.locator('[aria-label="Disconnect"]').first
-        if await disconnect_btn.count() > 0:
-            await disconnect_btn.click()
-            print("[STREAM] Disconnected from voice channel.")
-        await asyncio.sleep(2)
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+        for _ in range(3):
+            await page.mouse.move(960, 1000)
+            await asyncio.sleep(0.5)
+
+            still_in_vc = await page.evaluate("""
+                () => {
+                    const btn = document.querySelector('[aria-label="Disconnect"]');
+                    if (btn) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """)
+            if not still_in_vc:
+                break
+            print("[STREAM] Clicked Disconnect button, verifying state...")
+            await asyncio.sleep(1.5)
+
+        remaining = await page.locator('[aria-label="Disconnect"]').count()
+        if remaining == 0:
+            print("[STREAM] Confirmed voice channel disconnection.")
+        elif guild_url:
+            print("[WARN] Disconnect button still present! Forcing WebRTC teardown via page reset...")
+            await page.goto("about:blank", timeout=10000)
+            await asyncio.sleep(1)
+            await page.goto(guild_url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(6)
+
+        await page.mouse.move(0, 0)
     except Exception as e:
         print(f"[WARN] Error during voice disconnect: {e}")
 
 
-async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) -> bool:
+async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str, guild_url: str) -> bool:
+    global last_video_state
     print(f"[STREAM] Connecting to '{channel_name}' ({channel_id})...")
-    link = page.locator(f'a[href*="/{channel_id}"]').first
-    if await link.count() == 0:
+
+    if not await scroll_channel_into_view(page, channel_id):
+        print(f"[WARN] Channel {channel_name} not found in sidebar.")
         return False
 
-    await link.click()
+    link = page.locator(f'a[href*="/{channel_id}"]').first
+    try:
+        await link.click(timeout=10000)
+    except Exception as e:
+        print(f"[WARN] Failed to click channel link: {e}")
+        return False
+
     await asyncio.sleep(3)
 
-    # If Discord opens a voice lobby preview, click 'Join Voice' first and let it connect
     joined_lobby = await page.evaluate("""
         () => {
             const buttons = Array.from(document.querySelectorAll('button'));
@@ -202,9 +450,15 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) 
 
     await ensure_self_muted(page)
 
-    # Attempt up to 4 times to click 'Watch Stream' or a true stream tile (never normal voice avatar tiles)
-    watch_clicked = False
+    # Check if Discord already auto-focused/auto-started the stream upon joining VC
+    pre_state = await get_active_stream_video_state(page)
+    watch_clicked = pre_state.get("active", False)
+    if watch_clicked:
+        print("[STREAM] Stream auto-started upon joining VC!")
+
     for _ in range(4):
+        if watch_clicked:
+            break
         watch_clicked = await page.evaluate("""
             () => {
                 const buttons = Array.from(document.querySelectorAll('button'));
@@ -214,7 +468,7 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) 
                     return true;
                 }
                 const streamTile = document.querySelector(
-                    '[class*="streamPreview" i], [class*="tile" i]:has([class*="live" i])'
+                    '[class*="streamPreview" i], [class*="tile" i]:has([class*="liveBadge" i]), [class*="tile" i]:has([class*="liveIndicator" i])'
                 );
                 if (streamTile) {
                     streamTile.click();
@@ -225,61 +479,69 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str) 
         """)
         if watch_clicked:
             break
+        check_now = await get_active_stream_video_state(page)
+        if check_now.get("active"):
+            watch_clicked = True
+            break
         await asyncio.sleep(2)
 
-    print(f"[STREAM] Watch Stream triggered: {watch_clicked}")
+    print(f"[STREAM] Watch Stream active/triggered: {watch_clicked}")
     if not watch_clicked:
         print("[STREAM] Could not find Watch Stream button/tile. Disconnecting from VC...")
-        await leave_stream_and_voice(page)
+        await leave_stream_and_voice(page, guild_url)
         return False
 
-    # Wait for WebRTC/DAVE stream frames to actually start decoding
-    video_ready = await wait_for_stream_video(page, timeout_sec=25)
+    video_state = await wait_for_stream_video(page, timeout_sec=25)
+    video_ready = video_state.get("active", False)
     print(f"[STREAM] Video frames decoding: {video_ready}")
     if not video_ready:
         print("[STREAM] Stream video failed to decode within 25s. Disconnecting from VC...")
-        await leave_stream_and_voice(page)
+        await leave_stream_and_voice(page, guild_url)
         return False
 
-    # Hover over video briefly so Discord renders the bottom-right Full Screen button
-    video_el = page.locator("video").first
-    if await video_el.count() > 0:
-        try:
-            await video_el.hover(position={"x": 200, "y": 200})
+    last_video_state = {"time": -1.0, "frames": -1}
+    verify_pulseaudio_routing()
+
+    try:
+        box = video_state.get("box")
+        if box:
+            await page.mouse.move(box["x"], box["y"])
             await asyncio.sleep(1)
-        except Exception:
-            pass
 
-    fs_btn = page.locator('[aria-label="Full Screen"], [aria-label="Fullscreen"]').first
-    if await fs_btn.count() > 0:
-        await fs_btn.click()
-        print("[STREAM] Fullscreen triggered via button.")
-    elif await video_el.count() > 0:
-        await video_el.dblclick(position={"x": 200, "y": 200})
-        print("[STREAM] Fullscreen triggered via safe quadrant dblclick.")
+        fs_btn = page.locator('[aria-label="Full Screen"], [aria-label="Fullscreen"]').first
+        if await fs_btn.count() > 0:
+            await fs_btn.click(timeout=5000)
+            print("[STREAM] Fullscreen triggered via button.")
+        elif box:
+            await page.mouse.dblclick(box["x"], box["y"])
+            print("[STREAM] Fullscreen triggered via primary stream video safe quadrant dblclick.")
+    except Exception as e:
+        print(f"[WARN] Fullscreen trigger warning: {e}")
 
-    # Park mouse cursor at (0, 0) so Discord auto-hides bottom control bar & participant HUD
     await page.mouse.move(0, 0)
     await asyncio.sleep(2)
-    await page.screenshot(path=f"{SCREENSHOT_DIR}/stream_started_{int(time.time())}.png")
+    await safe_screenshot(page, f"{SCREENSHOT_DIR}/stream_started_{int(time.time())}.png")
     return True
 
 
 async def is_stream_still_active(page) -> bool:
-    """Verifies that an active stream video element (>=320px width) is still playing."""
-    try:
-        return await page.evaluate("""
-            () => {
-                const bodyText = document.body.innerText || "";
-                if (bodyText.includes("Stream has ended") || bodyText.includes("stream is currently paused")) {
-                    return false;
-                }
-                const videos = Array.from(document.querySelectorAll('video'));
-                return videos.some(v => v.readyState >= 2 && !v.paused && v.videoWidth >= 320);
-            }
-        """)
-    except Exception:
+    """Checks WebRTC track status, currentTime, and totalVideoFrames on the primary playing stream video."""
+    global last_video_state
+    state = await get_active_stream_video_state(page)
+    if not state.get("active"):
         return False
+
+    curr_t = state["currentTime"]
+    curr_f = state["frames"]
+
+    time_stuck = last_video_state["time"] >= 0 and abs(curr_t - last_video_state["time"]) < 0.001
+    frames_stuck = last_video_state["frames"] >= 0 and curr_f >= 0 and curr_f == last_video_state["frames"]
+
+    last_video_state = {"time": curr_t, "frames": curr_f}
+
+    if time_stuck and frames_stuck:
+        return False
+    return True
 
 
 async def main():
@@ -290,16 +552,24 @@ async def main():
     start_time = time.time()
     ffmpeg_proc = None
     segment_index = 0
+    failed_cooldowns = {}
+    consecutive_loop_errors = 0
+    all_channel_ids = [cid for _, cid in TARGET_CHANNELS]
+    guild_url = f"https://discord.com/channels/{GUILD_ID}/{TARGET_CHANNELS[0][1]}"
+    safe_token_json = json.dumps(DISCORD_TOKEN)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,  # Rendered on Xvfb :99
+            headless=False,
             args=[
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
                 "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--enable-unsafe-swiftshader",
+                "--disable-gpu-sandbox",
                 "--use-fake-ui-for-media-stream",
                 "--no-sandbox",
                 "--window-position=0,0",
@@ -311,13 +581,12 @@ async def main():
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             permissions=["microphone", "camera"],
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
 
-        # Inject Discord token via both direct localStorage and iframe fallback (survives Discord's boot wipe)
         init_script = f"""
             (() => {{
-                const token = JSON.stringify("{DISCORD_TOKEN}");
+                const token = JSON.stringify({safe_token_json});
                 try {{
                     window.localStorage.setItem('token', token);
                 }} catch (e) {{}}
@@ -335,51 +604,111 @@ async def main():
         await context.add_init_script(init_script)
 
         page = await context.new_page()
-        guild_url = f"https://discord.com/channels/{GUILD_ID}/{TARGET_CHANNELS[0][1]}"
         print(f"[INIT] Navigating to guild {GUILD_ID}...")
         try:
             await page.goto(guild_url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            print(f"[WARN] Navigation warning: {e}")
+            print(f"[WARN] Initial navigation warning: {e}")
 
-        await asyncio.sleep(10)
+        if not await verify_discord_login(page, timeout_sec=35):
+            await safe_screenshot(page, f"{SCREENSHOT_DIR}/00_LOGIN_FAILED.png")
+            print(f"[FATAL] Discord login or guild load failed (URL: {page.url}). Check 00_LOGIN_FAILED.png!")
+            await browser.close()
+            sys.exit(1)
 
-        await expand_all_categories(page)
+        await asyncio.sleep(5)
+        await dismiss_modals_and_expand_categories(page)
         await ensure_self_muted(page)
         await page.mouse.move(0, 0)
-        await page.screenshot(path=f"{SCREENSHOT_DIR}/01_guild_loaded.png")
-        print("[MONITOR] Polling 6 voice channels every 5 seconds...")
+        await safe_screenshot(page, f"{SCREENSHOT_DIR}/01_guild_loaded.png")
+        print("[MONITOR] Login & Guild verified. Polling 6 voice channels every 5 seconds...")
 
         try:
             while not stop_requested and (time.time() - start_time) < MAX_RUNTIME_SECONDS:
-                await expand_all_categories(page)
+                try:
+                    await dismiss_modals_and_expand_categories(page)
+                    live_map = await scan_all_channels_in_sidebar(page, all_channel_ids)
 
-                for ch_name, ch_id in TARGET_CHANNELS:
-                    if stop_requested or (time.time() - start_time) >= MAX_RUNTIME_SECONDS:
-                        break
+                    for ch_name, ch_id in TARGET_CHANNELS:
+                        if stop_requested or (time.time() - start_time) >= MAX_RUNTIME_SECONDS:
+                            break
 
-                    is_live = await check_channel_live(page, ch_id)
-                    if is_live:
-                        print(f"[DETECTED] LIVE badge found in '{ch_name}' ({ch_id})!")
-                        joined = await enter_stream_and_fullscreen(page, ch_name, ch_id)
-                        if joined:
+                        if time.time() < failed_cooldowns.get(ch_id, 0):
+                            continue
+
+                        if live_map.get(ch_id):
+                            print(f"[DETECTED] LIVE badge found in '{ch_name}' ({ch_id})!")
+                            joined = await enter_stream_and_fullscreen(page, ch_name, ch_id, guild_url)
+                            if not joined:
+                                print(f"[COOLDOWN] Putting '{ch_name}' on {FAILED_JOIN_COOLDOWN_SEC}s cooldown.")
+                                failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
+                                continue
+
                             segment_index += 1
                             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
                             safe_name = ch_name.replace(" ", "_")
                             raw_output = f"{RECORDINGS_DIR}/Floxi_Raw_{segment_index:02d}_{safe_name}_{ts}.mp4"
+                            ff_log = f"{LOGS_DIR}/ffmpeg_{segment_index:02d}_{safe_name}_{ts}.log"
 
-                            ffmpeg_proc = start_ffmpeg(raw_output)
+                            ffmpeg_proc = start_ffmpeg(raw_output, ff_log)
                             empty_checks = 0
+                            ffmpeg_fast_crashes = 0
+                            ffmpeg_total_restarts = 0
+                            last_file_size = 0
+                            stalled_size_checks = 0
 
-                            # Monitor active stream loop
                             while not stop_requested and (time.time() - start_time) < MAX_RUNTIME_SECONDS:
                                 await asyncio.sleep(5)
                                 await page.mouse.move(0, 0)
+
+                                proc_exited = ffmpeg_proc.poll() is not None
+                                curr_size = os.path.getsize(raw_output) if os.path.exists(raw_output) else 0
+                                uptime = time.time() - getattr(ffmpeg_proc, "_start_ts", time.time())
+
+                                if not proc_exited and uptime > 15.0:
+                                    if curr_size <= last_file_size:
+                                        stalled_size_checks += 1
+                                        print(f"[WARN] MP4 file size not growing ({curr_size} bytes) check {stalled_size_checks}/{MAX_STALLED_FILE_CHECKS}")
+                                    else:
+                                        stalled_size_checks = 0
+                                        last_file_size = curr_size
+
+                                if proc_exited or stalled_size_checks >= MAX_STALLED_FILE_CHECKS:
+                                    reason = f"exited code {ffmpeg_proc.returncode}" if proc_exited else "stalled output growth for 30s"
+                                    print(f"[ERROR] FFmpeg {reason} (uptime {uptime:.1f}s)!")
+                                    stop_ffmpeg(ffmpeg_proc)
+                                    ffmpeg_proc = None
+
+                                    ffmpeg_total_restarts += 1
+                                    if ffmpeg_total_restarts > MAX_FFMPEG_TOTAL_RESTARTS:
+                                        print(f"[FATAL] Exceeded max FFmpeg restarts ({MAX_FFMPEG_TOTAL_RESTARTS}) for this session! Aborting.")
+                                        failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
+                                        break
+
+                                    if uptime < 20.0:
+                                        ffmpeg_fast_crashes += 1
+                                        if ffmpeg_fast_crashes >= MAX_FFMPEG_FAST_CRASHES:
+                                            print("[FATAL] FFmpeg crashed 3 times rapidly! Aborting stream session.")
+                                            failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
+                                            break
+                                        backoff_sec = ffmpeg_fast_crashes + ffmpeg_fast_crashes + ffmpeg_fast_crashes
+                                        await asyncio.sleep(backoff_sec)
+                                    else:
+                                        ffmpeg_fast_crashes = 0
+
+                                    segment_index += 1
+                                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                                    raw_output = f"{RECORDINGS_DIR}/Floxi_Raw_{segment_index:02d}_{safe_name}_{ts}.mp4"
+                                    ff_log = f"{LOGS_DIR}/ffmpeg_{segment_index:02d}_{safe_name}_{ts}.log"
+                                    ffmpeg_proc = start_ffmpeg(raw_output, ff_log)
+                                    last_file_size = 0
+                                    stalled_size_checks = 0
+
                                 active = await is_stream_still_active(page)
                                 if not active:
                                     empty_checks += 1
-                                    print(f"[MONITOR] Stream inactive check {empty_checks}/6")
-                                    if empty_checks >= 6:  # 30s grace period for brief streamer lag
+                                    print(f"[MONITOR] Stream inactive/frozen check {empty_checks}/{INACTIVE_GRACE_CHECKS}")
+                                    if empty_checks >= INACTIVE_GRACE_CHECKS:
                                         print("[MONITOR] Stream ended. Stopping recording...")
                                         break
                                 else:
@@ -387,14 +716,34 @@ async def main():
 
                             stop_ffmpeg(ffmpeg_proc)
                             ffmpeg_proc = None
-                            await page.screenshot(path=f"{SCREENSHOT_DIR}/stream_ended_{segment_index:02d}.png")
-                            await leave_stream_and_voice(page)
+                            await safe_screenshot(page, f"{SCREENSHOT_DIR}/stream_ended_{segment_index:02d}.png")
+                            await leave_stream_and_voice(page, guild_url)
 
-                await asyncio.sleep(5)
+                    consecutive_loop_errors = 0
+                    await asyncio.sleep(5)
+
+                except Exception as loop_err:
+                    consecutive_loop_errors += 1
+                    print(f"[ERROR] Main loop exception ({consecutive_loop_errors}): {loop_err}")
+                    if ffmpeg_proc:
+                        stop_ffmpeg(ffmpeg_proc)
+                        ffmpeg_proc = None
+                    await leave_stream_and_voice(page, guild_url)
+
+                    if consecutive_loop_errors >= 3:
+                        print("[RECOVERY] Reloading Discord guild page...")
+                        try:
+                            await page.goto(guild_url, wait_until="domcontentloaded", timeout=60000)
+                            await asyncio.sleep(8)
+                            consecutive_loop_errors = 0
+                        except Exception as nav_err:
+                            print(f"[ERROR] Reload failed: {nav_err}")
+                    await asyncio.sleep(5)
 
         finally:
             if ffmpeg_proc:
                 stop_ffmpeg(ffmpeg_proc)
+            await leave_stream_and_voice(page, guild_url)
             await browser.close()
             print("[SHUTDOWN] Browser closed cleanly.")
 

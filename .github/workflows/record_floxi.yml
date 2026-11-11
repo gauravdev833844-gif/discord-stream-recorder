@@ -2,17 +2,45 @@ name: Record Floxi Discord Stream
 
 on:
   workflow_dispatch:
+    inputs:
+      max_runtime_seconds:
+        description: 'Max recording runtime in seconds (use 300 for a 5-min test run)'
+        required: false
+        default: '13200'
+      shifts_left:
+        description: 'Number of subsequent shifts to auto-chain (0 for single test run, 2 for full night)'
+        required: false
+        default: '0'
   schedule:
-    - cron: '15 15,19,23 * * *'
+    # Starts at 15:15 UTC (8:45 PM IST) and chains 2 more shifts automatically for zero-gap coverage
+    - cron: '15 15 * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: floxi-discord-stream-recorder
+  cancel-in-progress: false
 
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 300
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Free Runner Disk Space & Verify Available Storage
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/dotnet || true
+          df -h /
+          FREE_MB=$(df -BM / | awk 'NR==2 {gsub("M","",$4); print $4}')
+          echo "Available disk space: ${FREE_MB} MB"
+          if [ "$FREE_MB" -lt 15000 ]; then
+            echo "WARNING: Less than 15 GB free on runner!"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,15 +54,24 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Start Virtual Display & PulseAudio DiscordSink
+      - name: Start & Verify Virtual Display and PulseAudio Sinks (Fail-Fast)
         run: |
-          pulseaudio -D --exit-idle-time=-1 || true
-          pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description="DiscordSink" || true
-          pactl load-module module-null-sink sink_name=SilentMic sink_properties=device.description="SilentMic" || true
-          pactl set-default-sink DiscordSink || true
-          pactl set-default-source SilentMic.monitor || true
+          pulseaudio -D --exit-idle-time=-1
+          pactl unload-module module-suspend-on-idle || true
+          pactl load-module module-null-sink sink_name=DiscordSink sink_properties=device.description="DiscordSink"
+          pactl load-module module-null-sink sink_name=SilentMic sink_properties=device.description="SilentMic"
+          pactl set-default-sink DiscordSink
+          pactl set-default-source SilentMic.monitor
+
+          pactl list short sinks | grep -q "DiscordSink"
+          pactl list short sinks | grep -q "SilentMic"
+
           Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
-          sleep 2
+          for i in $(seq 1 20); do
+            [ -S /tmp/.X11-unix/X99 ] && break
+            sleep 0.5
+          done
+          [ -S /tmp/.X11-unix/X99 ] || { echo "FATAL: Xvfb :99 failed to start"; exit 1; }
 
       - name: Run Autonomous Discord Recorder
         env:
@@ -42,11 +79,36 @@ jobs:
           PULSE_SINK: DiscordSink
           PULSE_SOURCE: SilentMic.monitor
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          MAX_RUNTIME_SECONDS: "13500"
+          MAX_RUNTIME_SECONDS: ${{ inputs.max_runtime_seconds || '13200' }}
         run: |
           python -u recorder.py
 
-      - name: Remux All Recorded Segments for Fast Web Seeking
+      - name: Trigger Next Chained Shift Immediately (Zero-Gap Continuation)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SHIFTS: ${{ inputs.shifts_left }}
+          RUNTIME_SEC: ${{ inputs.max_runtime_seconds || '13200' }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            SHIFTS_LEFT=2
+          else
+            SHIFTS_LEFT=${INPUT_SHIFTS:-0}
+          fi
+
+          # Safety guard: short smoke tests (< 600s) never auto-chain
+          if [ "$RUNTIME_SEC" -lt 600 ] 2>/dev/null; then
+            SHIFTS_LEFT=0
+          fi
+
+          if [ "$SHIFTS_LEFT" -gt 0 ] 2>/dev/null; then
+            NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
+            echo "Queueing next shift immediately with shifts_left=${NEXT_SHIFTS}..."
+            gh workflow run record_floxi.yml --repo "${{ github.repository }}" --ref main -f max_runtime_seconds=13200 -f shifts_left="${NEXT_SHIFTS}" || true
+          fi
+
+      - name: Safe Disk-Checked Remux for Fast Web Seeking
         if: always()
         run: |
           mkdir -p final_recordings
@@ -54,40 +116,122 @@ jobs:
           for raw in recordings/Floxi_Raw_*.mp4; do
             base=$(basename "$raw" | sed 's/Floxi_Raw_/Floxi_Indori_Live_/')
             out="final_recordings/$base"
-            echo "Remuxing $raw -> $out ..."
-            ffmpeg -y -i "$raw" -c copy -movflags +faststart "$out" || cp "$raw" "$out"
-            rm -f "$raw"
+            FILE_MB=$(du -m "$raw" | cut -f1)
+            FREE_MB=$(df -BM / | awk 'NR==2 {gsub("M","",$4); print $4}')
+            REQUIRED_MB=$((FILE_MB * 2 + 1024))
+
+            if [ "$FREE_MB" -gt "$REQUIRED_MB" ]; then
+              echo "Remuxing $raw (${FILE_MB} MB, Free: ${FREE_MB} MB) -> $out ..."
+              ffmpeg -y -i "$raw" -c copy -movflags +faststart "$out" && rm -f "$raw" || mv "$raw" "$out"
+            else
+              echo "Low disk space (${FREE_MB} MB free for ${FILE_MB} MB file). Moving fragmented MP4 directly without remux..."
+              mv "$raw" "$out"
+            fi
           done
           ls -lh final_recordings/ || true
 
-      - name: Upload Recordings to Gofile Relay
-        if: always()
-        run: |
-          shopt -s nullglob
-          for mp4 in final_recordings/*.mp4; do
-            echo "Uploading $mp4 to Gofile..."
-            RESPONSE=$(curl -s -F "file=@${mp4}" "https://upload.gofile.io/uploadfile")
-            DOWNLOAD_LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage // empty')
-            if [ -z "$DOWNLOAD_LINK" ]; then
-              SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name // empty')
-              if [ -n "$SERVER" ]; then
-                RESPONSE=$(curl -s -F "file=@${mp4}" "https://${SERVER}.gofile.io/contents/uploadfile")
-                DOWNLOAD_LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage // empty')
-              fi
-            fi
-            echo "=========================================="
-            echo "File: $(basename "$mp4")"
-            echo "Gofile Download URL: ${DOWNLOAD_LINK:-UPLOAD_FAILED}"
-            echo "=========================================="
-          done
-
-      - name: Upload Screenshots & Recording Artifacts
+      - name: Upload All Recordings, Screenshots & FFmpeg Logs to GitHub Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: floxi-discord-recording-${{ github.run_id }}
+          name: floxi-recordings-and-diagnostics-${{ github.run_id }}
           path: |
             final_recordings/*.mp4
             screenshots/*.png
+            logs/*.log
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Upload Recordings to Gofile Relay (Official Regional + Dynamic Server Fallback + Checksum)
+        if: always()
+        run: |
+          shopt -s nullglob
+          GUEST_TOKEN=""
+          FOLDER_ID=""
+          UPLOAD_FAILURES=0
+
+          echo "### 🎬 Floxi Discord Recording Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| File | Size | Gofile Download Link |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+
+          ENDPOINTS=(
+            "https://upload.gofile.io/uploadfile"
+            "https://upload-na-nyc.gofile.io/uploadfile"
+            "https://upload-eu-par.gofile.io/uploadfile"
+            "https://upload-ap-sgp.gofile.io/uploadfile"
+          )
+
+          DYN_SERVER=$(curl -s --connect-timeout 10 https://api.gofile.io/servers | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
+          if [ -n "$DYN_SERVER" ]; then
+            ENDPOINTS+=("https://${DYN_SERVER}.gofile.io/contents/uploadfile")
+          fi
+
+          FOUND_FILES=0
+          for mp4 in final_recordings/*.mp4; do
+            FOUND_FILES=1
+            LOCAL_SIZE=$(stat -c%s "$mp4")
+            LOCAL_SIZE_MB=$((LOCAL_SIZE / 1048576))
+            LOCAL_MD5=$(md5sum "$mp4" | awk '{print $1}')
+            echo "Uploading $mp4 (Size: ${LOCAL_SIZE} bytes, MD5: ${LOCAL_MD5}) to Gofile..."
+            UPLOAD_OK=0
+
+            for endpoint in "${ENDPOINTS[@]}"; do
+              CURL_ARGS=(-s --connect-timeout 15 --max-time 240 --retry 1 --retry-delay 5 -F "file=@${mp4}")
+              [ -n "$GUEST_TOKEN" ] && CURL_ARGS+=(-F "token=${GUEST_TOKEN}")
+              [ -n "$FOLDER_ID" ] && CURL_ARGS+=(-F "folderId=${FOLDER_ID}")
+
+              RESPONSE=$(curl "${CURL_ARGS[@]}" "$endpoint" || true)
+              STATUS=$(echo "$RESPONSE" | jq -r '.status // empty' 2>/dev/null || true)
+
+              # If cross-region folderId caused failure, retry once on same endpoint without folderId
+              if [ "$STATUS" != "ok" ] && [ -n "$FOLDER_ID" ]; then
+                RESPONSE=$(curl -s --connect-timeout 15 --max-time 240 -F "file=@${mp4}" "$endpoint" || true)
+                STATUS=$(echo "$RESPONSE" | jq -r '.status // empty' 2>/dev/null || true)
+              fi
+
+              DOWNLOAD_LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
+              REMOTE_SIZE=$(echo "$RESPONSE" | jq -r '.data.size // empty' 2>/dev/null || true)
+              REMOTE_MD5=$(echo "$RESPONSE" | jq -r '.data.md5 // empty' 2>/dev/null || true)
+
+              SIZE_MATCH=1
+              if [ -n "$REMOTE_SIZE" ] && [ "$REMOTE_SIZE" != "0" ] && [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
+                SIZE_MATCH=0
+              fi
+
+              MD5_MATCH=1
+              if [ -n "$REMOTE_MD5" ] && [ "$REMOTE_MD5" != "$LOCAL_MD5" ]; then
+                MD5_MATCH=0
+              fi
+
+              if [ "$STATUS" = "ok" ] && [ -n "$DOWNLOAD_LINK" ] && [ "$SIZE_MATCH" -eq 1 ] && [ "$MD5_MATCH" -eq 1 ]; then
+                if [ -z "$GUEST_TOKEN" ]; then
+                  GUEST_TOKEN=$(echo "$RESPONSE" | jq -r '.data.guestToken // empty')
+                  FOLDER_ID=$(echo "$RESPONSE" | jq -r '.data.parentFolder // empty')
+                fi
+                echo "=========================================="
+                echo "SUCCESS ($endpoint): $(basename "$mp4")"
+                echo "Verified Size: ${REMOTE_SIZE:-$LOCAL_SIZE} bytes | MD5: ${REMOTE_MD5:-$LOCAL_MD5}"
+                echo "Gofile URL: $DOWNLOAD_LINK"
+                echo "=========================================="
+                echo "| $(basename "$mp4") | ${LOCAL_SIZE_MB} MB | [Download]($DOWNLOAD_LINK) |" >> $GITHUB_STEP_SUMMARY
+                UPLOAD_OK=1
+                break
+              else
+                echo "WARN: Upload/checksum failed on $endpoint (status=$STATUS), trying next..."
+              fi
+            done
+
+            if [ "$UPLOAD_OK" -eq 0 ]; then
+              UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+              echo "ERROR: All Gofile endpoints failed for $mp4! Recording is already safely stored in GitHub Artifacts."
+              echo "| $(basename "$mp4") | ${LOCAL_SIZE_MB} MB | ❌ Upload Failed (Available in GitHub Artifacts) |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          if [ "$FOUND_FILES" -eq 0 ]; then
+            echo "| *(No live stream detected during this shift)* | 0 MB | Offline |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$UPLOAD_FAILURES" -gt 0 ]; then
+            echo "WARNING: $UPLOAD_FAILURES recording(s) failed Gofile upload; download from GitHub Artifacts!"
+          fi
