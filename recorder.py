@@ -209,7 +209,7 @@ async def dismiss_modals_and_expand_categories(page):
 
 
 async def ensure_self_muted(page):
-    """Safely mutes ONLY the user's microphone in the bottom-left user panel."""
+    """Safely mutes ONLY the bot's microphone and ensures Deafen is OFF so incoming audio is captured."""
     try:
         await page.evaluate("""
             () => {
@@ -219,35 +219,69 @@ async def ensure_self_muted(page):
                 if (muteBtn && muteBtn.getAttribute('aria-checked') === 'false') {
                     muteBtn.click();
                 }
+                const deafenBtn = panels.querySelector('button[aria-label="Deafen"][role="switch"]');
+                if (deafenBtn && deafenBtn.getAttribute('aria-checked') === 'true') {
+                    deafenBtn.click();
+                }
             }
         """)
     except Exception:
         pass
 
 
-async def scan_all_channels_in_sidebar(page, channel_ids: list[str]) -> dict[str, bool]:
-    """Sweeps the virtualized sidebar once and checks LIVE status for all target channels."""
+async def scan_all_channels_in_sidebar(page, channel_ids: list[str]) -> dict[str, dict]:
+    """Sweeps the virtualized sidebar once and checks LIVE badge + voice participant count for all target channels."""
     try:
         return await page.evaluate(
             """
             async (chIds) => {
                 const results = {};
-                chIds.forEach(id => { results[id] = false; });
+                chIds.forEach(id => { results[id] = { live: false, users: 0 }; });
+                const targetSet = new Set(chIds);
 
                 const checkVisible = () => {
-                    for (const chId of chIds) {
-                        if (results[chId]) continue;
-                        const link = document.querySelector(`a[href*="/${chId}"]`);
+                    const scroller = document.querySelector('#channels [class*="scroller" i], nav [class*="scroller" i]') || document;
+                    let lastChId = null;
+                    const nodes = scroller.querySelectorAll('li, [class*="containerDefault" i], [class*="voiceUser" i]');
+                    for (const node of nodes) {
+                        if (node.matches('[class*="voiceUser" i]')) {
+                            if (lastChId && targetSet.has(lastChId)) {
+                                const txt = node.innerText || '';
+                                if (/\\bLIVE\\b/.test(txt) || node.querySelector('[class*="liveBadge" i], [class*="live_" i]')) {
+                                    results[lastChId].live = true;
+                                }
+                                results[lastChId].users = Math.max(results[lastChId].users, 1);
+                            }
+                            continue;
+                        }
+                        const link = node.querySelector('a[href*="/channels/"]');
                         if (!link) continue;
-                        const container = link.closest('li, [data-dnd-name], [class*="containerDefault" i]') || link.parentElement;
-                        if (!container) continue;
-                        const badgeHasLive = container.querySelector(
+                        const href = link.getAttribute('href') || '';
+                        const matchedId = chIds.find(id => href.includes('/' + id));
+                        lastChId = matchedId || null;
+                        if (!matchedId) continue;
+
+                        const badgeHasLive = node.querySelector(
                             '[class*="liveBadge" i], [class*="liveIndicator" i], [class*="live_" i], [class*="liveSmall" i]'
                         ) !== null;
-                        // Use innerText instead of textContent so adjacent React spans/divs keep word boundaries
-                        const textHasLive = /\\bLIVE\\b/.test(container.innerText || "");
+                        const textHasLive = /\\bLIVE\\b/.test(node.innerText || '');
                         if (badgeHasLive || textHasLive) {
-                            results[chId] = true;
+                            results[matchedId].live = true;
+                        }
+                        const vUsers = node.querySelectorAll('[class*="voiceUser" i]').length;
+                        if (vUsers > results[matchedId].users) {
+                            results[matchedId].users = vUsers;
+                        }
+                        const aria = (link.getAttribute('aria-label') || '') + ' ' + (node.getAttribute('aria-label') || '');
+                        const ariaMatch = aria.match(/(\\d+)\\s+(?:user|people|member)/i);
+                        if (ariaMatch) {
+                            const cnt = parseInt(ariaMatch[1], 10);
+                            if (cnt > results[matchedId].users) results[matchedId].users = cnt;
+                        }
+                        const pillMatch = (link.innerText || '').match(/\\b(\\d+)\\s*\\n\\s*\\d+\\b/);
+                        if (pillMatch) {
+                            const cnt = parseInt(pillMatch[1], 10);
+                            if (cnt > results[matchedId].users) results[matchedId].users = cnt;
                         }
                     }
                 };
@@ -259,7 +293,7 @@ async def scan_all_channels_in_sidebar(page, channel_ids: list[str]) -> dict[str
                 scroller.scrollTop = 0;
                 await new Promise(r => setTimeout(r, 80));
                 const maxScroll = scroller.scrollHeight;
-                for (let pos = 0; pos <= maxScroll; pos += 350) {
+                for (let pos = 0; pos <= maxScroll; pos += 300) {
                     scroller.scrollTop = pos;
                     await new Promise(r => setTimeout(r, 60));
                     checkVisible();
@@ -272,7 +306,7 @@ async def scan_all_channels_in_sidebar(page, channel_ids: list[str]) -> dict[str
         )
     except Exception as e:
         print(f"[WARN] Error during batch sidebar scan: {e}")
-        return {cid: False for cid in channel_ids}
+        return {cid: {"live": False, "users": 0} for cid in channel_ids}
 
 
 async def scroll_channel_into_view(page, channel_id: str) -> bool:
@@ -417,10 +451,9 @@ async def leave_stream_and_voice(page, guild_url: str = ""):
         print(f"[WARN] Error during voice disconnect: {e}")
 
 
-async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str, guild_url: str) -> bool:
-    global last_video_state
-    print(f"[STREAM] Connecting to '{channel_name}' ({channel_id})...")
-
+async def join_voice_channel(page, channel_name: str, channel_id: str, guild_url: str) -> bool:
+    """Clicks a voice channel, joins voice (if lobby shown), verifies Disconnect button, and routes PulseAudio."""
+    print(f"[VC] Connecting to '{channel_name}' ({channel_id})...")
     if not await scroll_channel_into_view(page, channel_id):
         print(f"[WARN] Channel {channel_name} not found in sidebar.")
         return False
@@ -448,15 +481,67 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str, 
     if joined_lobby:
         await asyncio.sleep(3)
 
-    await ensure_self_muted(page)
+    # Verify we actually connected to the VC (Disconnect control visible)
+    connected = False
+    for _ in range(5):
+        if await page.locator('[aria-label="Disconnect"]').count() > 0:
+            connected = True
+            break
+        await asyncio.sleep(1)
 
-    # Check if Discord already auto-focused/auto-started the stream upon joining VC
+    if not connected:
+        print(f"[WARN] Could not verify VC connection for '{channel_name}'.")
+        return False
+
+    await ensure_self_muted(page)
+    verify_pulseaudio_routing()
+    return True
+
+
+async def count_vc_participants(page, channel_id: str) -> int:
+    """Counts total participants currently visible in the connected VC (stage tiles or sidebar users)."""
+    try:
+        return await page.evaluate(
+            """
+            (chId) => {
+                let best = 0;
+                const callStage = document.querySelector('main, [class*="callContainer" i]');
+                if (callStage) {
+                    const tiles = callStage.querySelectorAll('[class*="tile" i][data-selenium-video-tile], [class*="callContainer" i] [class*="tile" i]');
+                    if (tiles.length > best) best = tiles.length;
+                }
+                const link = document.querySelector(`a[href*="/${chId}"]`);
+                if (link) {
+                    const node = link.closest('li, [class*="containerDefault" i]') || link.parentElement;
+                    if (node) {
+                        const vUsers = node.querySelectorAll('[class*="voiceUser" i]').length;
+                        if (vUsers > best) best = vUsers;
+                        const aria = (link.getAttribute('aria-label') || '') + ' ' + (node.getAttribute('aria-label') || '');
+                        const m = aria.match(/(\\d+)\\s+(?:user|people|member)/i);
+                        if (m) best = Math.max(best, parseInt(m[1], 10));
+                        const pill = (link.innerText || '').match(/\\b(\\d+)\\s*\\n\\s*\\d+\\b/);
+                        if (pill) best = Math.max(best, parseInt(pill[1], 10));
+                    }
+                }
+                return best;
+            }
+            """,
+            channel_id,
+        )
+    except Exception:
+        return 0
+
+
+async def try_watch_stream(page, timeout_sec: int = 12, take_screenshot: bool = True) -> bool:
+    """Tries to open an active screen-share stream inside the current VC and enter Fullscreen."""
+    global last_video_state
     pre_state = await get_active_stream_video_state(page)
     watch_clicked = pre_state.get("active", False)
     if watch_clicked:
         print("[STREAM] Stream auto-started upon joining VC!")
 
-    for _ in range(4):
+    attempts = max(1, timeout_sec // 3)
+    for _ in range(attempts):
         if watch_clicked:
             break
         watch_clicked = await page.evaluate("""
@@ -485,18 +570,11 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str, 
             break
         await asyncio.sleep(2)
 
-    print(f"[STREAM] Watch Stream active/triggered: {watch_clicked}")
     if not watch_clicked:
-        print("[STREAM] Could not find Watch Stream button/tile. Disconnecting from VC...")
-        await leave_stream_and_voice(page, guild_url)
         return False
 
-    video_state = await wait_for_stream_video(page, timeout_sec=25)
-    video_ready = video_state.get("active", False)
-    print(f"[STREAM] Video frames decoding: {video_ready}")
-    if not video_ready:
-        print("[STREAM] Stream video failed to decode within 25s. Disconnecting from VC...")
-        await leave_stream_and_voice(page, guild_url)
+    video_state = await wait_for_stream_video(page, timeout_sec=timeout_sec)
+    if not video_state.get("active", False):
         return False
 
     last_video_state = {"time": -1.0, "frames": -1}
@@ -519,8 +597,9 @@ async def enter_stream_and_fullscreen(page, channel_name: str, channel_id: str, 
         print(f"[WARN] Fullscreen trigger warning: {e}")
 
     await page.mouse.move(0, 0)
-    await asyncio.sleep(2)
-    await safe_screenshot(page, f"{SCREENSHOT_DIR}/stream_started_{int(time.time())}.png")
+    await asyncio.sleep(1.5)
+    if take_screenshot:
+        await safe_screenshot(page, f"{SCREENSHOT_DIR}/stream_started_{int(time.time())}.png")
     return True
 
 
@@ -623,103 +702,183 @@ async def main():
         await ensure_self_muted(page)
         await page.mouse.move(0, 0)
         await safe_screenshot(page, f"{SCREENSHOT_DIR}/01_guild_loaded.png")
-        print("[MONITOR] Login & Guild verified. Polling 6 voice channels every 5 seconds...")
+        print("[MONITOR] Login & Guild verified. Polling 6 voice channels (LIVE streams + active voice calls) every 5s...")
 
         try:
             while not stop_requested and (time.time() - start_time) < MAX_RUNTIME_SECONDS:
                 try:
                     await dismiss_modals_and_expand_categories(page)
-                    live_map = await scan_all_channels_in_sidebar(page, all_channel_ids)
+                    chan_map = await scan_all_channels_in_sidebar(page, all_channel_ids)
+                    now_ts = time.time()
 
+                    # Priority 1: Target channel with an active LIVE screen-share stream
+                    # Priority 2: Target channel with active voice participants (most users first)
+                    chosen = None
                     for ch_name, ch_id in TARGET_CHANNELS:
-                        if stop_requested or (time.time() - start_time) >= MAX_RUNTIME_SECONDS:
+                        if now_ts < failed_cooldowns.get(ch_id, 0):
+                            continue
+                        info = chan_map.get(ch_id) or {}
+                        if info.get("live"):
+                            chosen = (ch_name, ch_id, "stream", info.get("users", 1))
                             break
 
-                        if time.time() < failed_cooldowns.get(ch_id, 0):
+                    if not chosen:
+                        voice_candidates = []
+                        for ch_name, ch_id in TARGET_CHANNELS:
+                            if now_ts < failed_cooldowns.get(ch_id, 0):
+                                continue
+                            info = chan_map.get(ch_id) or {}
+                            users = int(info.get("users", 0) or 0)
+                            if users >= 1:
+                                voice_candidates.append((users, ch_name, ch_id))
+                        if voice_candidates:
+                            voice_candidates.sort(key=lambda x: x[0], reverse=True)
+                            users, ch_name, ch_id = voice_candidates[0]
+                            chosen = (ch_name, ch_id, "voice", users)
+
+                    if chosen:
+                        ch_name, ch_id, want_mode, user_hint = chosen
+                        print(f"[DETECTED] '{ch_name}' ({ch_id}) -> mode={want_mode} (users={user_hint})")
+                        vc_ok = await join_voice_channel(page, ch_name, ch_id, guild_url)
+                        if not vc_ok:
+                            print(f"[COOLDOWN] Putting '{ch_name}' on {FAILED_JOIN_COOLDOWN_SEC}s cooldown.")
+                            failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
                             continue
 
-                        if live_map.get(ch_id):
-                            print(f"[DETECTED] LIVE badge found in '{ch_name}' ({ch_id})!")
-                            joined = await enter_stream_and_fullscreen(page, ch_name, ch_id, guild_url)
-                            if not joined:
-                                print(f"[COOLDOWN] Putting '{ch_name}' on {FAILED_JOIN_COOLDOWN_SEC}s cooldown.")
-                                failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
+                        stream_ok = await try_watch_stream(page, timeout_sec=(20 if want_mode == "stream" else 6))
+                        if stream_ok:
+                            active_mode = "stream"
+                        else:
+                            part_count = await count_vc_participants(page, ch_id)
+                            if part_count < 2 and user_hint < 1:
+                                print(f"[VC] '{ch_name}' appears empty after join (participants={part_count}). Leaving...")
+                                await leave_stream_and_voice(page, guild_url)
+                                failed_cooldowns[ch_id] = time.time() + 30
                                 continue
+                            active_mode = "voice"
+                            await safe_screenshot(page, f"{SCREENSHOT_DIR}/voice_started_{int(time.time())}.png")
+                            print(f"[VOICE] Active voice call captured in '{ch_name}' (participants={part_count}, hint={user_hint})!")
 
-                            segment_index += 1
-                            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                            safe_name = ch_name.replace(" ", "_")
-                            raw_output = f"{RECORDINGS_DIR}/Floxi_Raw_{segment_index:02d}_{safe_name}_{ts}.mp4"
-                            ff_log = f"{LOGS_DIR}/ffmpeg_{segment_index:02d}_{safe_name}_{ts}.log"
+                        segment_index += 1
+                        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                        safe_name = ch_name.replace(" ", "_")
+                        raw_output = f"{RECORDINGS_DIR}/Floxi_Raw_{segment_index:02d}_{active_mode}_{safe_name}_{ts}.mp4"
+                        ff_log = f"{LOGS_DIR}/ffmpeg_{segment_index:02d}_{active_mode}_{safe_name}_{ts}.log"
 
-                            ffmpeg_proc = start_ffmpeg(raw_output, ff_log)
-                            empty_checks = 0
-                            ffmpeg_fast_crashes = 0
-                            ffmpeg_total_restarts = 0
-                            last_file_size = 0
-                            stalled_size_checks = 0
+                        ffmpeg_proc = start_ffmpeg(raw_output, ff_log)
+                        empty_checks = 0
+                        alone_checks = 0
+                        audio_routed_pass2 = False
+                        scan_tick = 0
+                        ffmpeg_fast_crashes = 0
+                        ffmpeg_total_restarts = 0
+                        last_file_size = 0
+                        stalled_size_checks = 0
 
-                            while not stop_requested and (time.time() - start_time) < MAX_RUNTIME_SECONDS:
-                                await asyncio.sleep(5)
-                                await page.mouse.move(0, 0)
+                        while not stop_requested and (time.time() - start_time) < MAX_RUNTIME_SECONDS:
+                            await asyncio.sleep(5)
+                            await page.mouse.move(0, 0)
+                            scan_tick += 1
 
-                                proc_exited = ffmpeg_proc.poll() is not None
-                                curr_size = os.path.getsize(raw_output) if os.path.exists(raw_output) else 0
-                                uptime = time.time() - getattr(ffmpeg_proc, "_start_ts", time.time())
+                            if not audio_routed_pass2 and scan_tick >= 2:
+                                verify_pulseaudio_routing()
+                                audio_routed_pass2 = True
 
-                                if not proc_exited and uptime > 15.0:
-                                    if curr_size <= last_file_size:
-                                        stalled_size_checks += 1
-                                        print(f"[WARN] MP4 file size not growing ({curr_size} bytes) check {stalled_size_checks}/{MAX_STALLED_FILE_CHECKS}")
-                                    else:
-                                        stalled_size_checks = 0
-                                        last_file_size = curr_size
+                            proc_exited = ffmpeg_proc.poll() is not None
+                            curr_size = os.path.getsize(raw_output) if os.path.exists(raw_output) else 0
+                            uptime = time.time() - getattr(ffmpeg_proc, "_start_ts", time.time())
 
-                                if proc_exited or stalled_size_checks >= MAX_STALLED_FILE_CHECKS:
-                                    reason = f"exited code {ffmpeg_proc.returncode}" if proc_exited else "stalled output growth for 30s"
-                                    print(f"[ERROR] FFmpeg {reason} (uptime {uptime:.1f}s)!")
-                                    stop_ffmpeg(ffmpeg_proc)
-                                    ffmpeg_proc = None
+                            if not proc_exited and uptime > 15.0:
+                                if curr_size <= last_file_size:
+                                    stalled_size_checks += 1
+                                    print(f"[WARN] MP4 file size not growing ({curr_size} bytes) check {stalled_size_checks}/{MAX_STALLED_FILE_CHECKS}")
+                                else:
+                                    stalled_size_checks = 0
+                                    last_file_size = curr_size
 
-                                    ffmpeg_total_restarts += 1
-                                    if ffmpeg_total_restarts > MAX_FFMPEG_TOTAL_RESTARTS:
-                                        print(f"[FATAL] Exceeded max FFmpeg restarts ({MAX_FFMPEG_TOTAL_RESTARTS}) for this session! Aborting.")
+                            if proc_exited or stalled_size_checks >= MAX_STALLED_FILE_CHECKS:
+                                reason = f"exited code {ffmpeg_proc.returncode}" if proc_exited else "stalled output growth for 30s"
+                                print(f"[ERROR] FFmpeg {reason} (uptime {uptime:.1f}s)!")
+                                stop_ffmpeg(ffmpeg_proc)
+                                ffmpeg_proc = None
+
+                                ffmpeg_total_restarts += 1
+                                if ffmpeg_total_restarts > MAX_FFMPEG_TOTAL_RESTARTS:
+                                    print(f"[FATAL] Exceeded max FFmpeg restarts ({MAX_FFMPEG_TOTAL_RESTARTS}) for this session! Aborting.")
+                                    failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
+                                    break
+
+                                if uptime < 20.0:
+                                    ffmpeg_fast_crashes += 1
+                                    if ffmpeg_fast_crashes >= MAX_FFMPEG_FAST_CRASHES:
+                                        print("[FATAL] FFmpeg crashed 3 times rapidly! Aborting stream session.")
                                         failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
                                         break
+                                    backoff_sec = ffmpeg_fast_crashes + ffmpeg_fast_crashes + ffmpeg_fast_crashes
+                                    await asyncio.sleep(backoff_sec)
+                                else:
+                                    ffmpeg_fast_crashes = 0
 
-                                    if uptime < 20.0:
-                                        ffmpeg_fast_crashes += 1
-                                        if ffmpeg_fast_crashes >= MAX_FFMPEG_FAST_CRASHES:
-                                            print("[FATAL] FFmpeg crashed 3 times rapidly! Aborting stream session.")
-                                            failed_cooldowns[ch_id] = time.time() + FAILED_JOIN_COOLDOWN_SEC
-                                            break
-                                        backoff_sec = ffmpeg_fast_crashes + ffmpeg_fast_crashes + ffmpeg_fast_crashes
-                                        await asyncio.sleep(backoff_sec)
-                                    else:
-                                        ffmpeg_fast_crashes = 0
+                                segment_index += 1
+                                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                                raw_output = f"{RECORDINGS_DIR}/Floxi_Raw_{segment_index:02d}_{active_mode}_{safe_name}_{ts}.mp4"
+                                ff_log = f"{LOGS_DIR}/ffmpeg_{segment_index:02d}_{active_mode}_{safe_name}_{ts}.log"
+                                ffmpeg_proc = start_ffmpeg(raw_output, ff_log)
+                                last_file_size = 0
+                                stalled_size_checks = 0
 
-                                    segment_index += 1
-                                    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                                    raw_output = f"{RECORDINGS_DIR}/Floxi_Raw_{segment_index:02d}_{safe_name}_{ts}.mp4"
-                                    ff_log = f"{LOGS_DIR}/ffmpeg_{segment_index:02d}_{safe_name}_{ts}.log"
-                                    ffmpeg_proc = start_ffmpeg(raw_output, ff_log)
-                                    last_file_size = 0
-                                    stalled_size_checks = 0
-
+                            if active_mode == "stream":
                                 active = await is_stream_still_active(page)
                                 if not active:
                                     empty_checks += 1
                                     print(f"[MONITOR] Stream inactive/frozen check {empty_checks}/{INACTIVE_GRACE_CHECKS}")
                                     if empty_checks >= INACTIVE_GRACE_CHECKS:
-                                        print("[MONITOR] Stream ended. Stopping recording...")
-                                        break
+                                        part_count = await count_vc_participants(page, ch_id)
+                                        if part_count >= 2:
+                                            print(f"[VOICE] Screen-share ended but {part_count} users still in VC — continuing in voice mode!")
+                                            active_mode = "voice"
+                                            empty_checks = 0
+                                            await page.keyboard.press("Escape")
+                                        else:
+                                            print("[MONITOR] Stream & VC ended. Stopping recording...")
+                                            break
                                 else:
                                     empty_checks = 0
+                            else:
+                                # Voice mode: check if screen-share started in current VC
+                                if await try_watch_stream(page, timeout_sec=3, take_screenshot=True):
+                                    print("[STREAM] Live stream started inside active VC! Upgraded voice -> stream.")
+                                    active_mode = "stream"
+                                    alone_checks = 0
+                                    continue
 
-                            stop_ffmpeg(ffmpeg_proc)
-                            ffmpeg_proc = None
-                            await safe_screenshot(page, f"{SCREENSHOT_DIR}/stream_ended_{segment_index:02d}.png")
-                            await leave_stream_and_voice(page, guild_url)
+                                # Check every 20s if a LIVE screen-share appeared in another target VC
+                                if scan_tick % 4 == 0:
+                                    other_map = await scan_all_channels_in_sidebar(page, all_channel_ids)
+                                    preempt = any(
+                                        cid != ch_id and (other_map.get(cid) or {}).get("live")
+                                        and time.time() >= failed_cooldowns.get(cid, 0)
+                                        for _, cid in TARGET_CHANNELS
+                                    )
+                                    if preempt:
+                                        print("[PREEMPT] Another target channel started a LIVE screen-share! Switching...")
+                                        break
+
+                                # Verify other people are still in this VC (>= 2 including bot)
+                                part_count = await count_vc_participants(page, ch_id)
+                                if part_count == 1:
+                                    alone_checks += 1
+                                    print(f"[VOICE] Bot appears alone in VC check {alone_checks}/6")
+                                    if alone_checks >= 6:
+                                        print("[VOICE] Everyone left VC. Stopping voice recording...")
+                                        break
+                                else:
+                                    alone_checks = 0
+
+                        stop_ffmpeg(ffmpeg_proc)
+                        ffmpeg_proc = None
+                        await safe_screenshot(page, f"{SCREENSHOT_DIR}/stream_ended_{segment_index:02d}.png")
+                        await leave_stream_and_voice(page, guild_url)
 
                     consecutive_loop_errors = 0
                     await asyncio.sleep(5)
