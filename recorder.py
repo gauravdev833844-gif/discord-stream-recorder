@@ -278,7 +278,8 @@ async def scan_all_channels_in_sidebar(page, channel_ids: list[str]) -> dict[str
                             const cnt = parseInt(ariaMatch[1], 10);
                             if (cnt > results[matchedId].users) results[matchedId].users = cnt;
                         }
-                        const pillMatch = (link.innerText || '').match(/\\b(\\d+)\\s*\\n\\s*\\d+\\b/);
+                        const pillScope = (link.parentElement ? link.parentElement.innerText : '') || link.innerText || '';
+                        const pillMatch = pillScope.match(/\\b(\\d+)\\s*\\n\\s*\\d+\\b/);
                         if (pillMatch) {
                             const cnt = parseInt(pillMatch[1], 10);
                             if (cnt > results[matchedId].users) results[matchedId].users = cnt;
